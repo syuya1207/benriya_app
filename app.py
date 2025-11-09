@@ -1,4 +1,4 @@
-from flask import Flask, request, abort
+from flask import Flask, request, abort, render_template # ★ render_template を追加
 import json
 import os
 from linebot import LineBotApi, WebhookHandler
@@ -14,7 +14,7 @@ import datetime
 # 環境変数（.envファイル）を読み込む
 load_dotenv()
 
-# ★★★ 外部ファイルのインポート（現在は未実装のためコメントアウト） ★★★
+# ★★★ 💡 【重要】未作成のファイルによるエラー回避のためコメントアウト ★★★
 # import constants
 # import tasks
 
@@ -26,13 +26,15 @@ SECRET_KEY = os.environ.get('SECRET_KEY')
 LINE_CHANNEL_ACCESS_TOKEN = os.environ.get('LINE_CHANNEL_ACCESS_TOKEN')
 LINE_CHANNEL_SECRET = os.environ.get('LINE_CHANNEL_SECRET')
 DATABASE_URL = os.environ.get("DATABASE_URL")
+HOST_URL = os.environ.get("HOST_URL") # ★★★ HOST_URL を取得 ★★★
 
 
 # キーが不足していた場合の致命的なエラーチェック
 if not all([LINE_CHANNEL_ACCESS_TOKEN, LINE_CHANNEL_SECRET, DATABASE_URL]):
     print("FATAL ERROR: 必要な環境変数が不足しています。LINE_... または DATABASE_URL を確認してください。")
-    # 本番環境ではexit(1)などで停止させるべきですが、ここではprintに留めます
 
+# 💡 デバッグ用（HOST_URLは正しく取得できています）
+print(f"DEBUG: HOST_URL is set to: {HOST_URL}")
 
 # =========================================================
 # 2. Flask/SDKの初期化
@@ -41,15 +43,14 @@ app = Flask(__name__)
 if SECRET_KEY:
     app.secret_key = SECRET_KEY
 else:
-    # ユーザー提供コードのWARNINGを維持
     print("WARNING: SECRET_KEY is missing. Session and security features will be disabled.")
 
 line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
 
-app.logger.info(f"DEBUG: Database URL is set to: {DATABASE_URL}")
+
 # =========================================================
-# 3. Webhookの処理ルート
+# 3. Webhookの処理ルート（省略）
 # =========================================================
 @app.route("/webhook", methods=['POST'])
 def webhook_handler():
@@ -57,7 +58,7 @@ def webhook_handler():
     body = request.get_data(as_text=True)
 
     print("\n--- WEBHOOK REQUEST RECEIVED ---")
-    app.logger.info("Request body: " + body) # 内部ログ
+    app.logger.info("Request body: " + body) 
 
     try:
         handler.handle(body, signature)
@@ -69,13 +70,9 @@ def webhook_handler():
 
 
 # =========================================================
-# 4. 🚨 PostgreSQL接続のための汎用関数（DictCursor前提）
+# 4. PostgreSQL接続のための汎用関数（省略）
 # =========================================================
-
 def execute_sql(sql_query, params=None, fetch=False):
-    """
-    SQLを実行し、結果が必要なら取得する汎用関数 (DictCursorを使用)
-    """
     conn = None
     if not DATABASE_URL:
         return {"error": "DATABASE_URLが設定されていません。"}
@@ -83,7 +80,6 @@ def execute_sql(sql_query, params=None, fetch=False):
     try:
         url = urlparse(DATABASE_URL)
         
-        # 接続確立
         conn = psycopg2.connect(
             dbname=url.path[1:],
             user=url.username,
@@ -91,7 +87,6 @@ def execute_sql(sql_query, params=None, fetch=False):
             host=url.hostname or None, 
             port=url.port or None 
         )
-        # DictCursorを使用するため、結果は辞書形式で返る
         cursor = conn.cursor(cursor_factory=extras.DictCursor) 
         cursor.execute(sql_query, params)
         
@@ -121,7 +116,7 @@ def handle_message(event):
     response_text = "コマンドが認識できませんでした。" 
     
     # ----------------------------------------------------
-    # 1. ユーザー認証ロジック：LINE IDの存在確認
+    # 1. ユーザー認証ロジック：ユーザー検索
     # ----------------------------------------------------
     USER_CHECK_SQL = "SELECT user_id FROM users WHERE user_line_id = %s;"
     user_result = execute_sql(USER_CHECK_SQL, params=(line_user_id,), fetch=True)
@@ -134,36 +129,36 @@ def handle_message(event):
     # ユーザーがDBに見つからなかった場合 (新規ユーザー)
     elif not user_result: 
         
-        # LINE Profile APIからユーザー名を取得
-        try:
-            profile = line_bot_api.get_profile(line_user_id)
-            user_line_name = profile.display_name
-        except Exception:
-            user_line_name = "お客様" # 取得失敗時のフォールバック
-        
-        # 登録誘導メッセージを構築
-        print(f"新規ユーザーを検出: {user_line_name} ({line_user_id})")
-        response_text = "{} さん、こんにちは！\n当サービスのご利用にはユーザー登録が必要です。\n\n『登録』と送っていただくと、登録フォームのURLをお送りします。".format(user_line_name)
-    
-    # ----------------------------------------------------
-    # 2. 既存ユーザーの場合の処理（今後の実装箇所）
-    # ----------------------------------------------------
-    else:
-        # user_result は辞書のリスト ([{'user_id': 123}]) なので、キーでIDを取得
-        user_id = user_result[0]['user_id']
-        
-        # ★★★ 既存のDBテストロジックの保持 ★★★
-        if user_text == "DBテスト":
-            sql = "SELECT version();"
-            result = execute_sql(sql, fetch=True)
-            response_text = f"✅ DB接続成功！\nバージョン情報:\n{result[0]['version']}" if not "error" in result else f"🚨 DB接続失敗。\nエラー: {result['error']}"
+        if user_text == "登録": # ★★★ ここでURLを返すロジックが実行されるはず ★★★
+            if not HOST_URL:
+                response_text = "🚨 設定エラー: フォームURLが設定されていません。"
+            else:
+                # /register_form は、次のルートで処理される
+                registration_url = f"{HOST_URL}/register_form?line_id={line_user_id}" 
+
+                response_text = "ユーザー登録ありがとうございます。\n以下のURLから必要事項を入力してください。\n\n"
+                response_text += registration_url
         
         else:
-            # 既存ユーザーのメッセージ処理本体（セッション管理や注文処理など）
-            response_text = f"ユーザーID: {user_id} の既存ユーザーです。\nメッセージ: '{user_text}' を受け付けました。"
-
+            # 登録誘導メッセージを構築 (変更なし)
+            try:
+                profile = line_bot_api.get_profile(line_user_id)
+                user_line_name = profile.display_name
+            except Exception:
+                user_line_name = "お客様" 
             
-    # LINEに応答を返す
+            print(f"新規ユーザーを検出: {user_line_name} ({line_user_id})")
+            response_text = "{} さん、こんにちは！\n当サービスのご利用にはユーザー登録が必要です。\n\n『登録』と送っていただくと、登録フォームのURLをお送りします。".format(user_line_name)
+    
+    # ----------------------------------------------------
+    # 2. 既存ユーザーの場合の処理（省略）
+    # ----------------------------------------------------
+    else:
+        # ... 既存ユーザーのロジック ...
+        user_id = user_result[0]['user_id']
+        response_text = f"ユーザーID: {user_id} の既存ユーザーです。\nメッセージ: '{user_text}' を受け付けました。"
+            
+    # LINEに応答を返す（省略）
     try:
         line_bot_api.reply_message(
             event.reply_token,
@@ -172,3 +167,18 @@ def handle_message(event):
         print(f"Reply sent successfully. Text: {response_text}")
     except Exception as e:
         print(f"REPLY API ERROR: {e}")
+
+
+# =========================================================
+# 6. 新しい Flask ルートの追加 (登録フォーム表示用)
+# =========================================================
+@app.route("/register_form", methods=['GET'])
+def display_registration_form():
+    """LINEから送られたURLクリック時にフォームを表示する"""
+    line_user_id = request.args.get('line_id')
+    
+    if not line_user_id:
+        return "エラー: LINE IDが不足しています。", 400
+
+    # templates/register_form.html をレンダリングし、LINE IDを渡す
+    return render_template('register_form.html', line_user_id=line_user_id)
