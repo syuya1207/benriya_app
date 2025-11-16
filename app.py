@@ -14,7 +14,6 @@ import datetime
 # 環境変数（.envファイル）を読み込む
 load_dotenv()
 
-# ★★★ 💡 【重要】未作成のファイルによるエラー回避のためコメントアウト ★★★
 # import constants
 # import tasks
 
