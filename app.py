@@ -17,7 +17,17 @@ import secrets # ★ 追加: 安全なトークン生成用
 from datetime import datetime, timedelta # ★ 修正: timedelta を追加
 
 import constants
-# import tasks
+
+from constants import ADMIN_KEYWORD_HOLIDAYS, ADMIN_HOLIDAYS_PATH
+
+ADMIN_CHECK_SQL = "SELECT admin_id FROM admins WHERE admin_line_id = %s;"
+INSERT_AUTH_TOKEN_SQL = """
+INSERT INTO auth_tokens 
+    (user_id, user_line_id, token, expires_at)
+VALUES 
+    (%s, %s, %s, %s)
+RETURNING token;
+"""
 
 # 環境変数（.envファイル）を読み込む
 load_dotenv()
@@ -185,8 +195,10 @@ def parse_and_validate_registration_data(user_text):
 def handle_message(event):
     line_user_id = event.source.user_id
     user_text = event.message.text
-    # response_textの初期値をNoneに変更し、確実にどこかのブロックで設定されるようにする
     response_text = None 
+    
+    # DBリセット用のSQL (全体で共有)
+    DELETE_SQL = "DELETE FROM registration_states WHERE user_line_id = %s;"
     
     # ----------------------------------------------------
     # 1. ユーザー認証ロジック：usersテーブルのチェック
@@ -195,12 +207,14 @@ def handle_message(event):
     user_result = execute_sql(USER_CHECK_SQL, params=(line_user_id,), fetch=True)
     
     if "error" in user_result:
+        # DB接続エラーが発生した場合
         response_text = f"🚨 データベースエラーが発生しました。時間を置いてお試しください。"
         
     # ----------------------------------------------------
     # 2. 既存ユーザーの場合の処理
     # ----------------------------------------------------
     elif user_result:
+        # usersテーブルにレコードがあった場合
         user_id = user_result[0]['user_id']
         response_text = f"ユーザーID: {user_id} の既存ユーザーです。\n通常の機能をご利用ください。"
         
@@ -215,26 +229,33 @@ def handle_message(event):
         except Exception:
             user_line_name = "お客様" 
             
-        # 状態の取得 (時間要素を削除したシンプルなSELECT)
-        STATE_SELECT_SQL = "SELECT temp_data FROM registration_states WHERE user_line_id = %s;"
+        # 状態の取得 (★変更点 1: JSONではなく個別カラムをSELECT)
+        STATE_SELECT_SQL = """
+        SELECT 
+            temp_user_grade, temp_user_class, temp_user_last_name, 
+            temp_user_first_name, temp_user_line_name
+        FROM registration_states WHERE user_line_id = %s;
+        """
         state_result = execute_sql(STATE_SELECT_SQL, params=(line_user_id,), fetch=True)
         
         state_data = state_result[0] if state_result and "error" not in state_result else None
-        
-        # DBリセット用のSQL (全体で共有)
-        DELETE_SQL = "DELETE FROM registration_states WHERE user_line_id = %s;"
         
         # ----------------------------------------------
         # A. 状態レコードが存在する場合（登録継続）
         # ----------------------------------------------
         if state_data:
-            # temp_dataはJSONBなので、使用前にPythonの辞書に変換する
-            temp_data_json = state_data.get('temp_data')
-            temp_data = json.loads(temp_data_json) if temp_data_json else {}
+            # ★★★ 変更点 2: DBから取得した個別カラムをtemp_data辞書に格納 ★★★
+            temp_data = {
+                'grade': state_data.get('temp_user_grade'),
+                'class': state_data.get('temp_user_class'),
+                'last_name': state_data.get('temp_user_last_name'),
+                'first_name': state_data.get('temp_user_first_name'),
+            }
+            # 'grade'がNoneでないかを見て、データが揃っているか否かを判定（簡略化）
+            is_data_filled = temp_data['grade'] is not None 
             
-            
-            # --- A-i. 最終確認待ち (temp_dataにデータあり) ---
-            if temp_data:
+            # --- A-i. 最終確認待ち (データがすべて揃っている場合) ---
+            if is_data_filled: 
                 
                 if user_text.lower() in ["はい", "yes"]:
                     # ★★★ 最終登録処理 (INSERT users, DELETE state) ★★★
@@ -252,30 +273,40 @@ def handle_message(event):
                         execute_sql(DELETE_SQL, (line_user_id,))
                         response_text = f"{user_line_name} さん、ユーザー登録が完了しました！🎉"
                     else:
-                        # 🚨 変更点: DBエラー時もDELETEを実行し、リセットを強制
-                        execute_sql(DELETE_SQL, (line_user_id,))
+                        execute_result = execute_sql(DELETE_SQL, (line_user_id,))
+                        # エラー時にDELETEが成功したかを確認するロジックを念のため追加
+                        if "success" not in execute_result:
+                             print(f"!!! 最終登録失敗後のDELETEにも失敗: {execute_result.get('error')} !!!")
                         response_text = f"🚨 最終登録処理中にデータベースエラーが発生しました。登録を中断しました。再度**「登録」**と送ってください。"
                         
                 else: 
-                    # 🚨 変更点: 「いいえ」またはその他のメッセージ -> 状態を破棄してリセット
+                    # 「いいえ」またはその他のメッセージ -> 状態を破棄してリセット
                     execute_sql(DELETE_SQL, (line_user_id,))
                     response_text = "登録を中断しました。再度**「登録」**と送ってください。"
 
-            # --- A-ii. データ入力待ち (temp_dataが空) ---
+            # --- A-ii. データ入力待ち (まだデータが未入力/不足している場合) ---
             else: 
-                # ★★★ statesがある場合のみ、parse_and_validate_registration_dataを実行 ★★★
+                # statesがある場合のみ、parse_and_validate_registration_dataを実行
                 validation_result = parse_and_validate_registration_data(user_text)
 
                 if validation_result.get("success"):
-                    # 検証成功 -> temp_dataに保存し、確認メッセージを返す
+                    # 検証成功 -> 個別カラムに保存し、確認メッセージを返す
                     new_temp_data = validation_result.get("data")
                     
+                    # ★★★ 変更点 3: JSONではなく個別カラムをUPDATE ★★★
                     UPDATE_SQL = """
                     UPDATE registration_states 
-                    SET temp_data = %s
+                    SET temp_user_grade = %s, temp_user_class = %s, 
+                        temp_user_last_name = %s, temp_user_first_name = %s,
+                        temp_user_line_name = %s -- LINE名も保存
                     WHERE user_line_id = %s;
                     """
-                    execute_sql(UPDATE_SQL, (json.dumps(new_temp_data), line_user_id))
+                    execute_sql(UPDATE_SQL, (
+                        new_temp_data['grade'], new_temp_data['class'], 
+                        new_temp_data['last_name'], new_temp_data['first_name'],
+                        user_line_name, # LINE名
+                        line_user_id
+                    ))
 
                     d = new_temp_data
                     response_text = f"以下の内容で登録しますか？\n"
@@ -284,7 +315,7 @@ def handle_message(event):
                     response_text += "\nよろしければ**「はい」**、やめる場合は「いいえ」と送ってください。"
 
                 else:
-                    # 検証失敗 -> 状態を破棄してリセット (ご要望の通り)
+                    # 検証失敗 -> 状態を破棄してリセット
                     execute_sql(DELETE_SQL, (line_user_id,))
                     error_message = validation_result.get('error', '入力が不正です。')
                     response_text = f"⚠️ 入力エラー：{error_message}\n\n登録を中断しました。再度**「登録」**と送ってください。"
@@ -294,15 +325,15 @@ def handle_message(event):
         # B. 状態レコードがない場合（登録トリガー or 誘導）
         # ----------------------------------------------
         else:
-            # ★★★ キーワード「登録」のチェックがトリガーとなる ★★★
+            # キーワード「登録」のチェックがトリガーとなる
             if user_text == "登録": 
                 
-                # registration_statesにINSERT (ステップ1)
+                # ★★★ 変更点 4: 空のJSONではなくNULL値でINSERT ★★★
                 INSERT_SQL = """
-                INSERT INTO registration_states (user_line_id, temp_data) 
-                VALUES (%s, %s);
+                INSERT INTO registration_states (user_line_id) 
+                VALUES (%s);
                 """
-                start_result = execute_sql(INSERT_SQL, (line_user_id, json.dumps({})))
+                start_result = execute_sql(INSERT_SQL, (line_user_id,))
                 
                 if "success" in start_result:
                     response_text = f"{user_line_name} さん、登録を開始します。\n\n**学年（1〜3）・クラス・姓・名**をスペース区切りで一度に返信してください。\n例: 2 1 山田 太郎"
@@ -312,7 +343,6 @@ def handle_message(event):
             # ユーザーが「登録」以外のメッセージを送った場合（通常の会話）
             else:
                 response_text = f"{user_line_name} さん、ユーザー情報が未登録です。\n登録をご希望の場合は、**「登録」**と送ってください。"
-
 
     # ----------------------------------------------------
     # 4. LINEに応答を返す
