@@ -17,17 +17,7 @@ import secrets # ★ 追加: 安全なトークン生成用
 from datetime import datetime, timedelta # ★ 修正: timedelta を追加
 
 import constants
-
-from constants import ADMIN_KEYWORD_HOLIDAYS, ADMIN_HOLIDAYS_PATH
-
-ADMIN_CHECK_SQL = "SELECT admin_id FROM admins WHERE admin_line_id = %s;"
-INSERT_AUTH_TOKEN_SQL = """
-INSERT INTO auth_tokens 
-    (user_id, user_line_id, token, expires_at)
-VALUES 
-    (%s, %s, %s, %s)
-RETURNING token;
-"""
+# import tasks
 
 # 環境変数（.envファイル）を読み込む
 load_dotenv()
