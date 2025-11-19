@@ -179,8 +179,9 @@ def parse_and_validate_registration_data(user_text):
     }        
 
 # =========================================================
-# 5. 🚨 メッセージイベント発生時の処理（新規ユーザー認証ロジック）
+# 5. 🚨 メッセージイベント発生時の処理（最終構造：ID状態とキーワードの組み合わせ）
 # =========================================================
+# ※ 外部で定義された line_bot_api, handler, execute_sql, parse_and_validate_registration_data を使用
 @handler.add(MessageEvent, message=TextMessage)
 def handle_message(event):
     line_user_id = event.source.user_id
@@ -191,38 +192,59 @@ def handle_message(event):
     DELETE_SQL = "DELETE FROM registration_states WHERE user_line_id = %s;"
     
     # ----------------------------------------------------
-    # 1. ユーザー認証ロジック：usersテーブルのチェック
+    # 1. ID 検索とステータス取得 (テーブル検索はここで完了)
     # ----------------------------------------------------
-    # 🔴 ローカル定義を維持 (お客様のコードそのまま)
     USER_CHECK_SQL = "SELECT user_id FROM users WHERE user_line_id = %s;" 
     user_result = execute_sql(USER_CHECK_SQL, params=(line_user_id,), fetch=True)
+    is_user = bool(user_result)
     
-    if "error" in user_result:
-        # DB接続エラーが発生した場合
+    ADMIN_CHECK_SQL = "SELECT admin_id FROM admins WHERE admin_line_id = %s;"
+    admin_result = execute_sql(ADMIN_CHECK_SQL, params=(line_user_id,), fetch=True)
+    is_admin = bool(admin_result)
+    
+    # DBエラーチェック
+    if "error" in user_result or "error" in admin_result:
         response_text = f"🚨 データベースエラーが発生しました。時間を置いてお試しください。"
         
     # ----------------------------------------------------
-    # 2. 既存ユーザーの場合の処理 (ここが管理者機能の組み込み先)
+    # 2. 応答決定ロジック（優先順位に基づく処理）
     # ----------------------------------------------------
-    elif user_result:
-        # usersテーブルにレコードがあった場合
-        user_id = user_result[0]['user_id']
+    
+    # 2.1. ⭐ 管理者機能の最優先処理 (is_userがTrueであることが前提)
+    # is_userがTrue かつ is_adminがTrueの場合のみ実行
+    if is_user and is_admin and user_text == "休み":
+        response_text = "管理者用休日登録機能"
         
-        # 💡 次のステップで、この場所（elifブロック内）に管理者チェックを組み込みます
-        response_text = f"ユーザーID: {user_id} の既存ユーザーです。\n通常の機能をご利用ください。"
+    elif is_user and is_admin and user_text == "テクマクマヤコン":
+        response_text = "ユーザー別注文状況機能"
         
-    # ----------------------------------------------------
-    # 3. 未登録ユーザーの場合 (新規登録フロー)
-    # ----------------------------------------------------
+    elif is_user and is_admin and user_text == "ゆりぴょんチェック":
+        response_text = "日別注文状況機能"
+        
+    # 2.1B. 一般ユーザー機能の処理 (is_userがTrueであることが前提)
+    elif is_user and user_text == "注文":
+        response_text = "一般ユーザー向け注文機能"
+            
+    # 2.2. 🔀 どの特殊キーワードにも合致しない場合の処理
+    # response_textがNoneの場合に実行
+    
+    # 2.2A. 登録済みユーザーのデフォルト応答 (is_userがTrue)
+    elif is_user:
+        # 管理者兼一般ユーザー、または一般ユーザーが、特殊キーワードではないメッセージを送った場合
+        response_text = "別のメッセージを送ってください"
+    
+    # 2.2B. 未登録ユーザーの処理 (is_userがFalseのすべて)
     else: 
-        # ユーザー名の取得
+        # is_adminが真/偽に関わらず、is_userが偽ならここに入り登録フローを優先する
+        
+        # ユーザー名の取得 (LINE Bot APIから取得)
         try:
             profile = line_bot_api.get_profile(line_user_id)
             user_line_name = profile.display_name
         except Exception:
-            user_line_name = "お客様" 
-            
-        # 状態の取得 (★変更点 1: JSONではなく個別カラムをSELECT)
+             user_line_name = "お客様"
+        
+        # 状態の取得 (登録継続中かチェック)
         STATE_SELECT_SQL = """
         SELECT 
             temp_user_grade, temp_user_class, temp_user_last_name, 
@@ -230,14 +252,13 @@ def handle_message(event):
         FROM registration_states WHERE user_line_id = %s;
         """
         state_result = execute_sql(STATE_SELECT_SQL, params=(line_user_id,), fetch=True)
-        
         state_data = state_result[0] if state_result and "error" not in state_result else None
-        
+    
         # ----------------------------------------------
         # A. 状態レコードが存在する場合（登録継続）
         # ----------------------------------------------
         if state_data:
-            # ★★★ 変更点 2: DBから取得した個別カラムをtemp_data辞書に格納 ★★★
+            
             temp_data = {
                 'grade': state_data.get('temp_user_grade'),
                 'class': state_data.get('temp_user_class'),
@@ -251,8 +272,7 @@ def handle_message(event):
             if is_data_filled: 
                 
                 if user_text.lower() in ["はい", "yes"]:
-                    # ★★★ 最終登録処理 (INSERT users, DELETE state) ★★★
-                    
+                    # 最終登録処理 (INSERT users, DELETE state)
                     INSERT_USERS_SQL = """
                     INSERT INTO users (user_line_id, user_grade, user_class, user_last_name, user_first_name, user_line_name)
                     VALUES (%s, %s, %s, %s, %s, %s);
@@ -266,10 +286,7 @@ def handle_message(event):
                         execute_sql(DELETE_SQL, (line_user_id,))
                         response_text = f"{user_line_name} さん、ユーザー登録が完了しました！🎉"
                     else:
-                        execute_result = execute_sql(DELETE_SQL, (line_user_id,))
-                        # エラー時にDELETEが成功したかを確認するロジックを念のため追加
-                        if "success" not in execute_result:
-                             print(f"!!! 最終登録失敗後のDELETEにも失敗: {execute_result.get('error')} !!!")
+                        execute_sql(DELETE_SQL, (line_user_id,))
                         response_text = f"🚨 最終登録処理中にデータベースエラーが発生しました。登録を中断しました。再度**「登録」**と送ってください。"
                         
                 else: 
@@ -279,25 +296,24 @@ def handle_message(event):
 
             # --- A-ii. データ入力待ち (まだデータが未入力/不足している場合) ---
             else: 
-                # statesがある場合のみ、parse_and_validate_registration_dataを実行
+                # parse_and_validate_registration_data は外部関数として定義済みと仮定
                 validation_result = parse_and_validate_registration_data(user_text)
 
                 if validation_result.get("success"):
                     # 検証成功 -> 個別カラムに保存し、確認メッセージを返す
                     new_temp_data = validation_result.get("data")
                     
-                    # ★★★ 変更点 3: JSONではなく個別カラムをUPDATE ★★★
                     UPDATE_SQL = """
                     UPDATE registration_states 
                     SET temp_user_grade = %s, temp_user_class = %s, 
                         temp_user_last_name = %s, temp_user_first_name = %s,
-                        temp_user_line_name = %s -- LINE名も保存
+                        temp_user_line_name = %s
                     WHERE user_line_id = %s;
                     """
                     execute_sql(UPDATE_SQL, (
                         new_temp_data['grade'], new_temp_data['class'], 
                         new_temp_data['last_name'], new_temp_data['first_name'],
-                        user_line_name, # LINE名
+                        user_line_name, 
                         line_user_id
                     ))
 
@@ -312,16 +328,13 @@ def handle_message(event):
                     execute_sql(DELETE_SQL, (line_user_id,))
                     error_message = validation_result.get('error', '入力が不正です。')
                     response_text = f"⚠️ 入力エラー：{error_message}\n\n登録を中断しました。再度**「登録」**と送ってください。"
-
-
+        
         # ----------------------------------------------
         # B. 状態レコードがない場合（登録トリガー or 誘導）
         # ----------------------------------------------
         else:
-            # キーワード「登録」のチェックがトリガーとなる
             if user_text == "登録": 
-                
-                # ★★★ 変更点 4: 空のJSONではなくNULL値でINSERT ★★★
+                # INSERT_SQL のロジック
                 INSERT_SQL = """
                 INSERT INTO registration_states (user_line_id) 
                 VALUES (%s);
@@ -329,19 +342,17 @@ def handle_message(event):
                 start_result = execute_sql(INSERT_SQL, (line_user_id,))
                 
                 if "success" in start_result:
-                    response_text = f"{user_line_name} さん、登録を開始します。\n\n**学年（1〜3）・クラス・姓・名**をスペース区切りで一度に返信してください。\n例: 2 1 山田 太郎"
+                    response_text = "登録を開始します。\n\n**学年（1〜3）・クラス・姓・名**をスペース区切りで一度に返信してください。\n例: 2 1 山田 太郎"
                 else:
                     response_text = "🚨 登録開始中にデータベースエラーが発生しました。再度「登録」と送ってください。"
-
-            # ユーザーが「登録」以外のメッセージを送った場合（通常の会話）
             else:
+                # 登録誘導メッセージ (管理者キーワードであってもここに来る)
                 response_text = f"{user_line_name} さん、ユーザー情報が未登録です。\n登録をご希望の場合は、**「登録」**と送ってください。"
-                
+
 
     # ----------------------------------------------------
-    # 4. LINEに応答を返す
+    # 3. LINEに応答を返す (最終処理)
     # ----------------------------------------------------
-    # 🚨 変更点: response_textが設定されているかチェック
     if response_text:
         try:
             line_bot_api.reply_message(
@@ -352,4 +363,4 @@ def handle_message(event):
         except Exception as e:
             print(f"REPLY API ERROR: {e}")
             return 'Error'
-    return 'OK' # response_textがNoneの場合も安全に終了
+    return 'OK'
