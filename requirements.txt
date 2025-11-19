@@ -1,4 +1,0 @@
-gunicorn
-psycopg2-binary
-Flask
-python-dotenv==1.2.1
