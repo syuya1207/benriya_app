@@ -1,0 +1,125 @@
+# トークンを生成・保存する
+
+def create_registration_token(line_user_id):
+    """
+    auth_tokens テーブルに登録用トークンを生成・保存する
+    """
+    # 1. ランダムでセキュアなトークンを生成 (64文字)
+    access_token = secrets.token_hex(32) # tokenカラムのVARCHAR(64)に合わせる
+    
+    # 2. トークンの作成時間と期限切れ時間を計算
+    created_at = datetime.now()
+    expires_at = created_at + timedelta(seconds=constants.TOKEN_EXPIRATION_SECONDS)
+
+    # 3. データベースに保存
+    # 古いトークンをクリーンアップ（ユーザーが再度「登録」と送った場合）
+    # user_line_idで判定
+    DELETE_SQL = "DELETE FROM auth_tokens WHERE user_line_id = %s AND user_id IS NULL;"
+    execute_sql(DELETE_SQL, (line_user_id,))
+    
+    INSERT_SQL = """
+    INSERT INTO auth_tokens (token, user_line_id, created_at, expires_at) 
+    VALUES (%s, %s, %s, %s);
+    """
+    result = execute_sql(
+        INSERT_SQL, 
+        params=(access_token, line_user_id, created_at, expires_at)
+    )
+
+    if "success" in result:
+        return access_token
+    return None
+
+
+
+# =========================================================
+# 5. 🚨 メッセージイベント発生時の処理（新規ユーザー認証ロジック）
+# =========================================================
+@handler.add(MessageEvent, message=TextMessage)
+def handle_message(event):
+    line_user_id = event.source.user_id
+    user_text = event.message.text
+    response_text = "コマンドが認識できませんでした。" 
+    
+    # ----------------------------------------------------
+    # 1. ユーザー認証ロジック：ユーザー検索
+    # ----------------------------------------------------
+    USER_CHECK_SQL = "SELECT user_id FROM users WHERE user_line_id = %s;"
+    user_result = execute_sql(USER_CHECK_SQL, params=(line_user_id,), fetch=True)
+    
+    # ユーザー検索でエラーが発生した場合
+    if "error" in user_result:
+        response_text = f"🚨 データベースエラーが発生しました。時間を置いてお試しください。"
+        print(f"!!! ユーザー検索失敗: {user_result['error']} !!!")
+    
+    # ユーザーがDBに見つからなかった場合 (新規ユーザー)
+    elif not user_result: 
+        
+        if user_text == constants.USER_KEYWORD_REGISTER:
+            if not HOST_URL:
+                response_text = "🚨 設定エラー: フォームURLが設定されていません。"
+            else:
+                # ★★★ 修正箇所: トークンを生成し、URLに埋め込む ★★★
+                generated_token = create_registration_token(line_user_id)
+                if generated_token:
+                    # トークンをURLのパラメータとして使用
+                    registration_url = f"{HOST_URL}/register_form?token={generated_token}"
+
+                    response_text = "ユーザー登録ありがとうございます。\n以下のURLから必要事項を入力してください。\n\n"
+                    response_text += registration_url
+                    response_text += "\n\n⚠️ このURLは5分で無効になります。"
+                else:
+                    response_text = "🚨 トークン生成中にエラーが発生しました。時間を置いてお試しください。"
+        else:
+            # 登録誘導メッセージを構築 (変更なし)
+            try:
+                profile = line_bot_api.get_profile(line_user_id)
+                user_line_name = profile.display_name
+            except Exception:
+                user_line_name = "お客様" 
+            
+            print(f"新規ユーザーを検出: {user_line_name} ({line_user_id})")
+            response_text = "{} さん、こんにちは！\n当サービスのご利用にはユーザー登録が必要です。\n\n『登録』と送っていただくと、登録フォームのURLをお送りします。".format(user_line_name)
+    
+    # ----------------------------------------------------
+    # 2. 既存ユーザーの場合の処理（省略）
+    # ----------------------------------------------------
+    else:
+        # ... 既存ユーザーのロジック ...
+        user_id = user_result[0]['user_id']
+        response_text = f"ユーザーID: {user_id} の既存ユーザーです。\nメッセージ: '{user_text}' を受け付けました。"
+            
+    # LINEに応答を返す（省略）
+    try:
+        line_bot_api.reply_message(
+            event.reply_token,
+            TextSendMessage(text=response_text)
+        )
+        print(f"Reply sent successfully. Text: {response_text}")
+    except Exception as e:
+        print(f"REPLY API ERROR: {e}")
+
+
+# =========================================================
+# 6. 新しい Flask ルートの追加 (登録フォーム表示用)
+# =========================================================
+@app.route("/register_form", methods=['GET'])
+def display_registration_form():
+    """LINEから送られたURLクリック時にフォームを表示する"""
+    access_token = request.args.get('token')
+    
+    if not access_token:
+        return "エラー: アクセストークンが不足しています。", 400
+
+    # 1. データベースでトークンを検索し、有効期限をチェックする
+    CHECK_TOKEN_SQL = "SELECT user_line_id FROM auth_tokens WHERE token = %s AND expires_at > NOW();"
+    token_result = execute_sql(CHECK_TOKEN_SQL, params=(access_token,), fetch=True)
+    
+    if not token_result:
+        return "エラー: トークンが無効であるか、有効期限が切れています。再度LINEで「登録」と送ってください。", 403
+
+    # 2. トークンから LINE ID を取得
+    line_user_id = token_result[0]['user_line_id']
+    
+    # templates/register_form.html をレンダリングし、LINE IDを渡す
+    return render_template('register_form.html', line_user_id=line_user_id)

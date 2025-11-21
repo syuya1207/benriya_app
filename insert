@@ -1,0 +1,34 @@
+INSERT INTO products (
+    product_id, 
+    product_name, 
+    price, 
+    schedule_type, 
+    schedule_day
+) VALUES
+-- メイン商品
+('BENTO001', '幕の内弁当', 550, 'DAILY', NULL),
+('BENTO002', 'チキン南蛮弁当', 550, 'DAILY', NULL),
+('BENTO003', 'カレーライス', 500, 'DAILY', NULL),
+('BENTO004', '焼きそば', 500, 'DAILY', NULL),
+('BENTO005', '唐揚げセット弁当', 550, 'DAILY', NULL),
+('BENTO006', 'ナスみそ弁当', 550, 'WEEKLY', 'MON'),
+('BENTO007', 'ハンバーグ丼', 500, 'WEEKLY', 'TUE'),
+('BENTO008', '豚丼', 500, 'WEEKLY', 'WED'),
+('BENTO009', 'ソースカツ丼', 500, 'WEEKLY', 'THU'),
+('BENTO010', 'ミックスフライ弁当', 550, 'WEEKLY', 'FRI'),
+('BENTO011', '味噌カツ丼', 500, 'WEEKLY', 'MON'),
+('BENTO012', 'そぼろ丼', 500, 'WEEKLY', 'TUE'),
+('BENTO013', 'のり弁', 500, 'WEEKLY', 'WED'),
+('BENTO014', '唐揚げ丼', 500, 'WEEKLY', 'THU'),
+('BENTO015', 'かつ丼', 500, 'WEEKLY', 'FRI');
+
+INSERT INTO admins (
+    admin_line_id, 
+    admin_last_name, 
+    admin_first_name
+) 
+VALUES (
+    'Ua2fbd796309a14b07126af0464b4c588', 
+    '渡辺', 
+    '修矢'
+);
