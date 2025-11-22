@@ -131,8 +131,7 @@ def execute_sql(sql_query, params=None, fetch=False):
 # ---------------------------------------------
 def generate_auth_key(id_type: str, id_value: str) -> str:
     """認証種別とID値を受け取り、自己検証型キーを生成し、NonceをDBに記録する。"""
-    # 🚨 修正: 処理開始のログを最優先で出力 🚨
-    print(f"--- STARTING AUTH KEY GENERATION for {id_value} ---", flush=True)
+    
     try:
         # 1. Nonce (ランダムな値) の生成
         nonce = secrets.token_hex(32) 
