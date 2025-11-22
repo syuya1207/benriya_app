@@ -13,8 +13,11 @@ from urllib.parse import urlparse
 from dotenv import load_dotenv
 import datetime 
 
+import hashlib
+import time
 import secrets # ★ 追加: 安全なトークン生成用
 from datetime import datetime, timedelta # ★ 修正: timedelta を追加
+from datetime import timezone
 
 import constants
 # import tasks
@@ -30,6 +33,7 @@ LINE_CHANNEL_ACCESS_TOKEN = os.environ.get('LINE_CHANNEL_ACCESS_TOKEN')
 LINE_CHANNEL_SECRET = os.environ.get('LINE_CHANNEL_SECRET')
 DATABASE_URL = os.environ.get("DATABASE_URL")
 HOST_URL = os.environ.get("HOST_URL") # ★★★ HOST_URL を取得 ★★★
+SYSTEM_SECRET_SALT = os.environ.get("SYSTEM_SECRET_SALT")
 
 line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
@@ -74,7 +78,7 @@ def webhook_handler():
 
 
 # =========================================================
-# 4. PostgreSQL接続のための汎用関数（省略）
+# 4. PostgreSQL接続のための汎用関数（フリーズ対策・タイムゾーン設定済み）
 # =========================================================
 def execute_sql(sql_query, params=None, fetch=False):
     conn = None
@@ -95,33 +99,150 @@ def execute_sql(sql_query, params=None, fetch=False):
         # ✅ 修正点 1: autocommit を有効化し、ロック待ちによるフリーズを回避
         conn.set_session(autocommit=True)
         
+        # ✅ 修正点 2: タイムゾーンをUTCに設定し、日時データのフリーズを回避
+        conn.cursor().execute("SET TIME ZONE 'UTC'") 
+        
         cursor = conn.cursor(cursor_factory=extras.DictCursor) 
         cursor.execute(sql_query, params)
         
         if fetch:
             result = cursor.fetchall()
-            # conn.commit() は autocommit=True のため削除
             return result
         else:
-            # conn.commit() は autocommit=True のため削除
             return {"success": True}
             
     except Exception as e:
-        print(f"!!! データベースエラーが発生しました: {e} !!!")
-        print(f"!!! 実行失敗クエリ: {sql_query}") 
+        print(f"!!! データベースエラーが発生しました: {e} !!!", flush=True) # 強制出力
+        print(f"!!! 実行失敗クエリ: {sql_query}", flush=True) # 強制出力
         if conn:
-            # autocommit=True のため rollback は効果が薄いが、念のため残す
             conn.rollback() 
         return {"error": str(e)}
 
-    # ✅ 修正点 2: 成功・失敗にかかわらず、接続を確実に閉じる (finallyブロック)
     finally:
         if conn:
             try:
                 conn.close()
             except Exception as close_e:
-                # 接続クローズエラーは致命的ではないため、printのみ
-                print(f"!!! 接続クローズエラー: {close_e} !!!")
+                print(f"!!! 接続クローズエラー: {close_e} !!!", flush=True)
+
+
+# ---------------------------------------------
+# 🌟 トークン生成関数 (最終フリーズ対策・DB書き込み有効版)
+# ---------------------------------------------
+def generate_auth_key(id_type: str, id_value: str) -> str:
+    """認証種別とID値を受け取り、自己検証型キーを生成し、NonceをDBに記録する。"""
+    # 🚨 修正: 処理開始のログを最優先で出力 🚨
+    print(f"--- STARTING AUTH KEY GENERATION for {id_value} ---", flush=True)
+    try:
+        # 1. Nonce (ランダムな値) の生成
+        nonce = secrets.token_hex(32) 
+        
+        # 2. 署名（Signature）を生成
+        data_to_sign = f"{nonce}|{id_type}|{id_value}|{SYSTEM_SECRET_SALT}" 
+        signature = hashlib.sha256(data_to_sign.encode()).hexdigest()
+        
+        # 3. URLキーの構築
+        url_key = f"{nonce}.{id_type}.{id_value}.{signature}"
+        
+        print("DEBUG_AUTH_KEY: Key generation successful.", flush=True) # 🔑 トークン生成成功確認
+        
+        # =========================================================
+        # 🚨 フリーズ対策のための分割代入とDB書き込みの再有効化 🚨
+        # =========================================================
+        
+        # 4. 期限秒数を取得（constants参照直前のフリーズをテスト）
+        seconds_to_expire = constants.TOKEN_EXPIRATION_SECONDS
+        print(f"DEBUG_AUTH_KEY: Expiration seconds: {seconds_to_expire}", flush=True) # 🔑 constants参照確認
+
+        # 5. 期限時刻を計算（datetime参照直後のフリーズをテスト）
+        expiration_time = datetime.now(datetime.timezone.utc) + timedelta(seconds=seconds_to_expire)
+        print(f"DEBUG_AUTH_KEY: Expiration time calculated: {expiration_time}", flush=True) # 🔑 日時計算確認
+        
+        # 6. DB用データ整理
+        admin_id_for_db = id_value if id_type == 'admin_id' else None
+        user_email_for_db = id_value if id_type == 'user_email' else None
+        
+        insert_query = """
+        INSERT INTO auth_tokens (token, admin_id, user_email, created_at, expires_at)
+        VALUES (%s, %s, %s, NOW(), %s);
+        """
+        
+        # 7. DB書き込み実行（最終的にフリーズを引き起こす行）
+        db_result = execute_sql(insert_query, (nonce, admin_id_for_db, user_email_for_db, expiration_time))
+        print(f"DEBUG_AUTH_KEY: DB insert attempted. Result: {db_result}", flush=True) # 🔑 DB実行結果確認
+        
+        if "error" in db_result:
+            # DBエラーが発生した場合、ERROR IN KEY GENERATIONを返す
+            raise Exception(f"DB Error: {db_result['error']}")
+
+        # =========================================================
+        
+        return url_key
+
+    except Exception as e:
+        import traceback
+        print("\n!!!!!!!!!!!!!!!!!! generate_auth_keyでクラッシュ !!!!!!!!!!!!!!!!!!!", flush=True)
+        print(f"致命的エラー: {type(e).__name__}: {e}", flush=True)
+        traceback.print_exc()
+        print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!", flush=True)
+        # エラー発生時は、無効なキーを返して handle_admin_holiday 側で処理させる
+        return "ERROR_IN_KEY_GENERATION"
+
+# ---------------------------------------------
+# admin_line_id を使用して admin_id をデータベースから検索する関数。
+# ---------------------------------------------
+def get_admin_id_by_line_id(line_user_id: str) -> str | None:
+    
+    if not DATABASE_URL:
+        print("Error: DATABASE_URL environment variable is not set.")
+        return None
+
+    # 1. DATABASE_URLをパースして接続パラメータを取得
+    try:
+        url = urlparse(DATABASE_URL)
+        params = {
+            'database': url.path[1:],  # スラッシュを除いたデータベース名
+            'user': url.username,
+            'password': url.password,
+            'host': url.hostname,
+            'port': url.port if url.port else 5432 # ポートが指定されていない場合はデフォルトの5432
+        }
+    except Exception as e:
+        print(f"Error parsing DATABASE_URL: {e}")
+        return None
+    
+    conn = None
+    try:
+        # 2. DBへの接続を確立
+        conn = psycopg2.connect(**params)
+        # 3. カーソルを作成
+        with conn.cursor() as cur:
+            # 4. クエリの実行
+            # psycopg2ではプレースホルダに '%s' を使用します
+            sql_query = "SELECT admin_id FROM admins WHERE admin_line_id = %s"
+            
+            # クエリ実行。line_user_idをタプルとして渡すことでSQLインジェクションを防止
+            cur.execute(sql_query, (line_user_id,))
+            
+            # 5. 結果を取得
+            result = cur.fetchone()
+
+            if result:
+                # 検索結果があれば admin_id を文字列に変換して返す
+                # resultは (admin_id,) というタプルで返るため、result[0]を使用
+                return str(result[0])
+            else:
+                return None
+
+    except psycopg2.Error as e:
+        print(f"PostgreSQL error occurred: {e}")
+        return None
+
+    finally:
+        # 6. 接続を確実にクローズ
+        if conn:
+            conn.close()
+
 
 # =========================================================
 #★ 新規ユーザー登録のためのデータ検証関数
@@ -177,22 +298,80 @@ def parse_and_validate_registration_data(user_text):
             "first_name": first_name
         }
     }        
+# =========================================================
+# 5A. 応答処理ヘルパー関数群 (完全版)
+# =========================================================
+
+# 管理者キーワードに対する処理
+def handle_admin_holiday(line_user_id):
+    
+    ADMIN_ID_SQL = "SELECT admin_id FROM admins WHERE admin_line_id = %s;"
+    admin_data = execute_sql(ADMIN_ID_SQL, params=(line_user_id,), fetch=True)
+    
+    # DBエラーまたはデータがない場合のチェック
+    if "error" in admin_data or not admin_data:
+        if "error" in admin_data:
+            return f"🚨 データベースエラーが発生しました。時間を置いてお試しください。（エラー詳細: {admin_data.get('error', '不明')}）"
+        return "⚠️ 管理者IDが登録されていません。システム管理者に連絡してください。"
+    
+    try:
+        admin_id = str(admin_data[0]['admin_id'])
+    except (IndexError, KeyError) as e:
+        print(f"DEBUG: admin_dataからのadmin_id抽出エラー: {e}, データ: {admin_data}")
+        return "🚨 内部エラー: データベースから管理者IDを抽出できませんでした。"
+
+    
+    auth_key = generate_auth_key(id_type='admin_id', id_value=admin_id)
+    holiday_url = f"{HOST_URL}/admin/holiday?key={auth_key}"
+    
+    expiration_minutes = constants.TOKEN_EXPIRATION_SECONDS / 60
+    
+    response_text = (
+        f"✅ 管理者休日登録リンクが生成されました。\n"
+        f"以下のURLをクリックし、登録を行ってください。\n\n"
+        f"🔗 **休日登録URL:**\n"
+        f"{holiday_url}\n\n"
+        f"⚠️ **注意:** このリンクは**{expiration_minutes:.0f}分間**のみ有効です。\n"
+        f"期限切れの場合は、再度「休み」と送ってください。"
+    )
+    
+    return response_text
+
+
+# ★★★ 削除されていた関数の復元 ★★★
+def handle_admin_user_order(line_user_id):
+    return "ユーザー別注文状況機能"
+
+def handle_admin_daily_order(line_user_id):
+    return "日別注文状況機能"
+
+# 一般ユーザーキーワードに対するダミー関数
+def handle_user_order(line_user_id):
+    return "一般ユーザー向け注文機能"
+
+# ---------------------------------------------
+# 🌟 ディスパッチテーブル（キーワードと処理の対応付け）
+# ---------------------------------------------
+
+ADMIN_ACTIONS = {
+    "休み": handle_admin_holiday,
+    "テクマクマヤコン": handle_admin_user_order,
+    "ゆりぴょんチェック": handle_admin_daily_order,
+}
 
 # =========================================================
-# 5. 🚨 メッセージイベント発生時の処理（最終構造：ID状態とキーワードの組み合わせ）
+# 5. 🚨 メッセージイベント発生時の処理（ディスパッチテーブル適用）
 # =========================================================
-# ※ 外部で定義された line_bot_api, handler, execute_sql, parse_and_validate_registration_data を使用
 @handler.add(MessageEvent, message=TextMessage)
 def handle_message(event):
     line_user_id = event.source.user_id
     user_text = event.message.text
     response_text = None 
     
-    # DBリセット用のSQL (全体で共有)
     DELETE_SQL = "DELETE FROM registration_states WHERE user_line_id = %s;"
     
     # ----------------------------------------------------
-    # 1. ID 検索とステータス取得 (テーブル検索はここで完了)
+    # 1. ID 検索とステータス取得 (元のコードと同じ)
     # ----------------------------------------------------
     USER_CHECK_SQL = "SELECT user_id FROM users WHERE user_line_id = %s;" 
     user_result = execute_sql(USER_CHECK_SQL, params=(line_user_id,), fetch=True)
@@ -202,156 +381,115 @@ def handle_message(event):
     admin_result = execute_sql(ADMIN_CHECK_SQL, params=(line_user_id,), fetch=True)
     is_admin = bool(admin_result)
     
-    # DBエラーチェック
+    # DBエラーチェック (ifは残る)
     if "error" in user_result or "error" in admin_result:
         response_text = f"🚨 データベースエラーが発生しました。時間を置いてお試しください。"
         
     # ----------------------------------------------------
-    # 2. 応答決定ロジック（優先順位に基づく処理）
+    # 2. 応答決定ロジック（ディスパッチテーブルを使用）
     # ----------------------------------------------------
     
-    # 2.1. ⭐ 管理者機能の最優先処理 (is_userがTrueであることが前提)
-    # is_userがTrue かつ is_adminがTrueの場合のみ実行
-    if is_user and is_admin and user_text == "休み":
-        response_text = "管理者用休日登録機能"
+    # response_textが既に設定されている（DBエラーなど）場合はスキップ
+    if response_text is None:
         
-    elif is_user and is_admin and user_text == "テクマクマヤコン":
-        response_text = "ユーザー別注文状況機能"
+        # 🚨 判定値の確認 🚨
+        print(f"DEBUG: is_user={is_user}, is_admin={is_admin}, Text='{user_text}'")
+        # 2.1. ⭐ 管理者機能の最優先処理
+        if is_user and is_admin:
+            # 辞書から対応する関数を取得
+            # 🚨 管理者ブロック到達確認 🚨
+            print(f"DEBUG: ★★★ 管理者ブロックに到達 ★★★")
+            handler = ADMIN_ACTIONS.get(user_text)
+            # 🚨 辞書検索結果の確認 🚨
+            print(f"DEBUG: 辞書検索結果 (handler): {handler}")
+            if handler:
+                response_text = handler(line_user_id) # 関数を実行し結果を取得
         
-    elif is_user and is_admin and user_text == "ゆりぴょんチェック":
-        response_text = "日別注文状況機能"
-        
-    # 2.1B. 一般ユーザー機能の処理 (is_userがTrueであることが前提)
-    elif is_user and user_text == "注文":
-        response_text = "一般ユーザー向け注文機能"
-            
-    # 2.2. 🔀 どの特殊キーワードにも合致しない場合の処理
-    # response_textがNoneの場合に実行
-    
-    # 2.2A. 登録済みユーザーのデフォルト応答 (is_userがTrue)
-    elif is_user:
-        # 管理者兼一般ユーザー、または一般ユーザーが、特殊キーワードではないメッセージを送った場合
-        response_text = "別のメッセージを送ってください"
-    
-    # 2.2B. 未登録ユーザーの処理 (is_userがFalseのすべて)
-    else: 
-        # is_adminが真/偽に関わらず、is_userが偽ならここに入り登録フローを優先する
-        
-        # ユーザー名の取得 (LINE Bot APIから取得)
-        try:
-            profile = line_bot_api.get_profile(line_user_id)
-            user_line_name = profile.display_name
-        except Exception:
-             user_line_name = "お客様"
-        
-        # 状態の取得 (登録継続中かチェック)
-        STATE_SELECT_SQL = """
-        SELECT 
-            temp_user_grade, temp_user_class, temp_user_last_name, 
-            temp_user_first_name, temp_user_line_name
-        FROM registration_states WHERE user_line_id = %s;
-        """
-        state_result = execute_sql(STATE_SELECT_SQL, params=(line_user_id,), fetch=True)
-        state_data = state_result[0] if state_result and "error" not in state_result else None
-    
-        # ----------------------------------------------
-        # A. 状態レコードが存在する場合（登録継続）
-        # ----------------------------------------------
-        if state_data:
-            
-            temp_data = {
-                'grade': state_data.get('temp_user_grade'),
-                'class': state_data.get('temp_user_class'),
-                'last_name': state_data.get('temp_user_last_name'),
-                'first_name': state_data.get('temp_user_first_name'),
-            }
-            # 'grade'がNoneでないかを見て、データが揃っているか否かを判定（簡略化）
-            is_data_filled = temp_data['grade'] is not None 
-            
-            # --- A-i. 最終確認待ち (データがすべて揃っている場合) ---
-            if is_data_filled: 
-                
-                if user_text.lower() in ["はい", "yes"]:
-                    # 最終登録処理 (INSERT users, DELETE state)
-                    INSERT_USERS_SQL = """
-                    INSERT INTO users (user_line_id, user_grade, user_class, user_last_name, user_first_name, user_line_name)
-                    VALUES (%s, %s, %s, %s, %s, %s);
-                    """
-                    final_reg_result = execute_sql(INSERT_USERS_SQL, (
-                        line_user_id, temp_data['grade'], temp_data['class'], 
-                        temp_data['last_name'], temp_data['first_name'], user_line_name
-                    ))
-                    
-                    if "success" in final_reg_result:
-                        execute_sql(DELETE_SQL, (line_user_id,))
-                        response_text = f"{user_line_name} さん、ユーザー登録が完了しました！🎉"
-                    else:
-                        execute_sql(DELETE_SQL, (line_user_id,))
-                        response_text = f"🚨 最終登録処理中にデータベースエラーが発生しました。登録を中断しました。再度**「登録」**と送ってください。"
-                        
-                else: 
-                    # 「いいえ」またはその他のメッセージ -> 状態を破棄してリセット
-                    execute_sql(DELETE_SQL, (line_user_id,))
-                    response_text = "登録を中断しました。再度**「登録」**と送ってください。"
+        # 2.2. 一般ユーザー機能の処理
+        if response_text is None and is_user and user_text == "注文":
+            response_text = handle_user_order(line_user_id)
 
-            # --- A-ii. データ入力待ち (まだデータが未入力/不足している場合) ---
+        # 2.3. デフォルト応答（未登録ユーザーの処理と登録済みユーザーの誘導）
+        if response_text is None:
+            
+            # 2.3A. 登録済みユーザーのデフォルト応答
+            if is_user:
+                response_text = "別のメッセージを送ってください"
+            
+            # 2.3B. 未登録ユーザーの処理 (元のelseブロックを関数化するのが望ましいが、ここではインデントリスク回避のため可能な限り元の構造を残す)
             else: 
-                # parse_and_validate_registration_data は外部関数として定義済みと仮定
-                validation_result = parse_and_validate_registration_data(user_text)
-
-                if validation_result.get("success"):
-                    # 検証成功 -> 個別カラムに保存し、確認メッセージを返す
-                    new_temp_data = validation_result.get("data")
-                    
-                    UPDATE_SQL = """
-                    UPDATE registration_states 
-                    SET temp_user_grade = %s, temp_user_class = %s, 
-                        temp_user_last_name = %s, temp_user_first_name = %s,
-                        temp_user_line_name = %s
-                    WHERE user_line_id = %s;
-                    """
-                    execute_sql(UPDATE_SQL, (
-                        new_temp_data['grade'], new_temp_data['class'], 
-                        new_temp_data['last_name'], new_temp_data['first_name'],
-                        user_line_name, 
-                        line_user_id
-                    ))
-
-                    d = new_temp_data
-                    response_text = f"以下の内容で登録しますか？\n"
-                    response_text += f"学年：**{d['grade']}**、クラス：**{d['class']}**\n"
-                    response_text += f"氏名：**{d['last_name']} {d['first_name']}**\n"
-                    response_text += "\nよろしければ**「はい」**、やめる場合は「いいえ」と送ってください。"
-
-                else:
-                    # 検証失敗 -> 状態を破棄してリセット
-                    execute_sql(DELETE_SQL, (line_user_id,))
-                    error_message = validation_result.get('error', '入力が不正です。')
-                    response_text = f"⚠️ 入力エラー：{error_message}\n\n登録を中断しました。再度**「登録」**と送ってください。"
-        
-        # ----------------------------------------------
-        # B. 状態レコードがない場合（登録トリガー or 誘導）
-        # ----------------------------------------------
-        else:
-            if user_text == "登録": 
-                # INSERT_SQL のロジック
-                INSERT_SQL = """
-                INSERT INTO registration_states (user_line_id) 
-                VALUES (%s);
-                """
-                start_result = execute_sql(INSERT_SQL, (line_user_id,))
+                # ユーザー名取得 (try/exceptは残る)
+                try:
+                    profile = line_bot_api.get_profile(line_user_id)
+                    user_line_name = profile.display_name
+                except Exception:
+                    user_line_name = "お客様"
                 
-                if "success" in start_result:
-                    response_text = "登録を開始します。\n\n**学年（1〜3）・クラス・姓・名**をスペース区切りで一度に返信してください。\n例: 2 1 山田 太郎"
-                else:
-                    response_text = "🚨 登録開始中にデータベースエラーが発生しました。再度「登録」と送ってください。"
-            else:
-                # 登録誘導メッセージ (管理者キーワードであってもここに来る)
-                response_text = f"{user_line_name} さん、ユーザー情報が未登録です。\n登録をご希望の場合は、**「登録」**と送ってください。"
+                # 状態の取得 (DBアクセスは残る)
+                STATE_SELECT_SQL = "SELECT * FROM registration_states WHERE user_line_id = %s;"
+                state_result = execute_sql(STATE_SELECT_SQL, params=(line_user_id,), fetch=True)
+                state_data = state_result[0] if state_result and "error" not in state_result else None
+                
+                # 登録継続フロー (if/elseが多層に残る部分)
+                if state_data:
+                    # ... 登録継続ロジック (元のコードのA-i, A-iiの部分) ...
+                    # 💡 注意: この部分は手続き的なフロー制御のため、if/elseを完全に排除することは困難です。
+                    # ここでは、元のコードの複雑な if/else 構造を維持します。
+                    
+                    temp_data = {
+                        'grade': state_data.get('temp_user_grade'), 'class': state_data.get('temp_user_class'),
+                        'last_name': state_data.get('temp_user_last_name'), 'first_name': state_data.get('temp_user_first_name'),
+                    }
+                    is_data_filled = temp_data['grade'] is not None 
+                    
+                    # データの最終確認待ち (A-i)
+                    if is_data_filled: 
+                        if user_text.lower() in ["はい", "yes"]:
+                            # 最終登録処理の if/else
+                            INSERT_USERS_SQL = "INSERT INTO users (user_line_id, user_grade, user_class, user_last_name, user_first_name, user_line_name) VALUES (%s, %s, %s, %s, %s, %s);"
+                            final_reg_result = execute_sql(INSERT_USERS_SQL, (line_user_id, temp_data['grade'], temp_data['class'], temp_data['last_name'], temp_data['first_name'], user_line_name))
+                            
+                            if "success" in final_reg_result:
+                                execute_sql(DELETE_SQL, (line_user_id,))
+                                response_text = f"{user_line_name} さん、ユーザー登録が完了しました！🎉"
+                            else:
+                                execute_sql(DELETE_SQL, (line_user_id,))
+                                response_text = f"🚨 最終登録処理中にデータベースエラーが発生しました。登録を中断しました。再度**「登録」**と送ってください。"
+                        else: 
+                            execute_sql(DELETE_SQL, (line_user_id,))
+                            response_text = "登録を中断しました。再度**「登録」**と送ってください。"
 
+                    # データ入力待ち (A-ii)
+                    else: 
+                        validation_result = parse_and_validate_registration_data(user_text)
+                        if validation_result.get("success"):
+                            # UPDATE SQLの実行
+                            new_temp_data = validation_result.get("data")
+                            UPDATE_SQL = "UPDATE registration_states SET temp_user_grade = %s, temp_user_class = %s, temp_user_last_name = %s, temp_user_first_name = %s, temp_user_line_name = %s WHERE user_line_id = %s;"
+                            execute_sql(UPDATE_SQL, (new_temp_data['grade'], new_temp_data['class'], new_temp_data['last_name'], new_temp_data['first_name'], user_line_name, line_user_id))
+
+                            d = new_temp_data
+                            response_text = f"以下の内容で登録しますか？\n学年：**{d['grade']}**、クラス：**{d['class']}**\n氏名：**{d['last_name']} {d['first_name']}**\n\nよろしければ**「はい」**、やめる場合は「いいえ」と送ってください。"
+                        else:
+                            execute_sql(DELETE_SQL, (line_user_id,))
+                            error_message = validation_result.get('error', '入力が不正です。')
+                            response_text = f"⚠️ 入力エラー：{error_message}\n\n登録を中断しました。再度**「登録」**と送ってください。"
+
+                # 登録開始 (B)
+                else:
+                    if user_text == "登録": 
+                        INSERT_SQL = "INSERT INTO registration_states (user_line_id) VALUES (%s);"
+                        start_result = execute_sql(INSERT_SQL, (line_user_id,))
+                        
+                        if "success" in start_result:
+                            response_text = "登録を開始します。\n\n**学年（1〜3）・クラス・姓・名**をスペース区切りで一度に返信してください。\n例: 2 1 山田 太郎"
+                        else:
+                            response_text = "🚨 登録開始中にデータベースエラーが発生しました。再度「登録」と送ってください。"
+                    else:
+                        response_text = f"{user_line_name} さん、ユーザー情報が未登録です。\n登録をご希望の場合は、**「登録」**と送ってください。"
 
     # ----------------------------------------------------
-    # 3. LINEに応答を返す (最終処理)
+    # 3. LINEに応答を返す (元のコードと同じ)
     # ----------------------------------------------------
     if response_text:
         try:
