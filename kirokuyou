@@ -1,125 +1,506 @@
-# トークンを生成・保存する
+from flask import Flask, request, abort, render_template # ★ render_template を追加
+import re             # 正規表現処理用
+import unicodedata    # 全角・半角変換用
+import json
+import os
+from linebot import LineBotApi, WebhookHandler
+from linebot.exceptions import InvalidSignatureError
+from linebot.models import MessageEvent, TextMessage, TextSendMessage
 
-def create_registration_token(line_user_id):
-    """
-    auth_tokens テーブルに登録用トークンを生成・保存する
-    """
-    # 1. ランダムでセキュアなトークンを生成 (64文字)
-    access_token = secrets.token_hex(32) # tokenカラムのVARCHAR(64)に合わせる
-    
-    # 2. トークンの作成時間と期限切れ時間を計算
-    created_at = datetime.now()
-    expires_at = created_at + timedelta(seconds=constants.TOKEN_EXPIRATION_SECONDS)
+import psycopg2
+from psycopg2 import extras
+from urllib.parse import urlparse
+from dotenv import load_dotenv
+import datetime 
 
-    # 3. データベースに保存
-    # 古いトークンをクリーンアップ（ユーザーが再度「登録」と送った場合）
-    # user_line_idで判定
-    DELETE_SQL = "DELETE FROM auth_tokens WHERE user_line_id = %s AND user_id IS NULL;"
-    execute_sql(DELETE_SQL, (line_user_id,))
-    
-    INSERT_SQL = """
-    INSERT INTO auth_tokens (token, user_line_id, created_at, expires_at) 
-    VALUES (%s, %s, %s, %s);
-    """
-    result = execute_sql(
-        INSERT_SQL, 
-        params=(access_token, line_user_id, created_at, expires_at)
-    )
+import logging
+import sys
 
-    if "success" in result:
-        return access_token
-    return None
+import hashlib
+import time
+import secrets # ★ 追加: 安全なトークン生成用
+from datetime import datetime, timedelta # ★ 修正: timedelta を追加
+from datetime import timezone
 
+import constants
+# import tasks
+
+# 環境変数（.envファイル）を読み込む
+load_dotenv()
+
+# =========================================================
+# 1. 環境変数と認証情報の取得
+# =========================================================
+SECRET_KEY = os.environ.get('SECRET_KEY') 
+LINE_CHANNEL_ACCESS_TOKEN = os.environ.get('LINE_CHANNEL_ACCESS_TOKEN')
+LINE_CHANNEL_SECRET = os.environ.get('LINE_CHANNEL_SECRET')
+DATABASE_URL = os.environ.get("DATABASE_URL")
+HOST_URL = os.environ.get("HOST_URL") # ★★★ HOST_URL を取得 ★★★
+SYSTEM_SECRET_SALT = os.environ.get("SYSTEM_SECRET_SALT")
+
+line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
+handler = WebhookHandler(LINE_CHANNEL_SECRET)
+
+# キーが不足していた場合の致命的なエラーチェック
+if not all([LINE_CHANNEL_ACCESS_TOKEN, LINE_CHANNEL_SECRET, DATABASE_URL]):
+    print("FATAL ERROR: 必要な環境変数が不足しています。LINE_... または DATABASE_URL を確認してください。")
+
+# 💡 デバッグ用（HOST_URLは正しく取得できています）
+print(f"DEBUG: HOST_URL is set to: {HOST_URL}")
 
 
 # =========================================================
-# 5. 🚨 メッセージイベント発生時の処理（新規ユーザー認証ロジック）
+# 2. Flask/SDKの初期化
+# =========================================================
+app = Flask(__name__)
+if SECRET_KEY:
+    app.secret_key = SECRET_KEY
+else:
+    print("WARNING: SECRET_KEY is missing. Session and security features will be disabled.")
+
+# =========================================================
+# 基本的なロギング設定
+# =========================================================
+logging.basicConfig(
+    level=logging.INFO, # INFOレベル以上を記録
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    # ログを標準エラー出力(sys.stderr)に確実に出力させる
+    stream=sys.stderr 
+)
+logger = logging.getLogger(__name__)
+# =========================================================
+# 3. Webhookの処理ルート（省略）
+# =========================================================
+@app.route("/webhook", methods=['POST'])
+def webhook_handler():
+    signature = request.headers.get('X-Line-Signature')
+    body = request.get_data(as_text=True)
+
+    print("\n--- WEBHOOK REQUEST RECEIVED ---")
+    app.logger.info("Request body: " + body) 
+
+    try:
+        handler.handle(body, signature)
+    except InvalidSignatureError:
+        print("Invalid signature. Check your channel secret.")
+        abort(400) 
+
+    return 'OK', 200
+
+
+# =========================================================
+# 4. PostgreSQL接続のための汎用関数（フリーズ対策・タイムゾーン設定済み）
+# =========================================================
+def execute_sql(sql_query, params=None, fetch=False):
+    conn = None
+    if not DATABASE_URL:
+        return {"error": "DATABASE_URLが設定されていません。"}
+        
+    try:
+        url = urlparse(DATABASE_URL)
+        
+        conn = psycopg2.connect(
+            dbname=url.path[1:],
+            user=url.username,
+            password=url.password,
+            host=url.hostname or None, 
+            port=url.port or None 
+        )
+        
+        # ✅ 修正点 1: autocommit を有効化し、ロック待ちによるフリーズを回避
+        conn.set_session(autocommit=True)
+        
+        # ✅ 修正点 2: タイムゾーンをUTCに設定し、日時データのフリーズを回避
+        conn.cursor().execute("SET TIME ZONE 'UTC'") 
+        
+        cursor = conn.cursor(cursor_factory=extras.DictCursor) 
+        cursor.execute(sql_query, params)
+        
+        if fetch:
+            result = cursor.fetchall()
+            return result
+        else:
+            return {"success": True}
+            
+    except Exception as e:
+        #print(f"!!! データベースエラーが発生しました: {e} !!!", flush=True) # 強制出力
+        #print(f"!!! 実行失敗クエリ: {sql_query}", flush=True) # 強制出力
+        logger.error(f"!!! データベースエラーが発生しました: {e} !!!") 
+        logger.error(f"!!! 実行失敗クエリ: {sql_query}")
+        #if conn:
+            #conn.rollback() 
+        return {"error": str(e)}
+
+    finally:
+        if conn:
+            try:
+                conn.close()
+            except Exception as close_e:
+                print(f"!!! 接続クローズエラー: {close_e} !!!", flush=True)
+
+# --------------------------------------------------------------------------
+#   認証キー（URLキーとNonce）の純粋な生成を行う。有効期限計算、DB処理は行わない。
+# --------------------------------------------------------------------------   
+def generate_auth_key(id_type: str, id_value: str) -> dict:
+    """
+    認証種別とID値を受け取り、IDを秘匿したキーの構成要素を生成する。
+    """
+    
+    try:
+        # 1. Nonce (ランダムな値) の生成
+        nonce = secrets.token_hex(32) 
+        
+        # 2. 署名（Signature）を生成
+        # 署名は、ID、Nonce、Saltを使って生成し、改ざん防止の証拠とする。
+        data_to_sign = f"{nonce}|{id_type}|{id_value}|{SYSTEM_SECRET_SALT}" 
+        signature = hashlib.sha256(data_to_sign.encode()).hexdigest()
+        
+        # 3. URLキーの構築 🚨 ID VALUE をURLから完全に削除 🚨
+        url_key = f"{nonce}.{signature}"
+        
+        # DBに保存するために必要な情報を返す
+        return {
+            "url_key": url_key,
+            "nonce": nonce,                  
+            "admin_id": id_value if id_type == 'admin_id' else None,            
+            "user_email": id_value if id_type == 'user_email' else None,
+        }
+    except Exception as e:
+        # ... (エラー処理) ...
+        pass
+
+# ----------------------------------------------
+#トークン情報を受け取り、有効期限を計算（#4, #5）し、DBに記録する。
+# ----------------------------------------------
+
+def insert_auth_token(token_data: dict) -> dict:
+    try:
+        # 🚨 #4 & #5. 期限時刻の計算 (generate_auth_keyから移動) 🚨
+        seconds_to_expire = constants.TOKEN_EXPIRATION_SECONDS 
+        expiration_time = datetime.now(timezone.utc) + timedelta(seconds=seconds_to_expire)
+        
+        # SQLクエリ定義
+        insert_query = "INSERT INTO auth_tokens (token, admin_id, user_email, created_at, expires_at) VALUES (%s, %s, %s, NOW(), %s);"
+        
+        # DBに渡す引数を準備
+        db_params = (
+            token_data["nonce"], 
+            token_data["admin_id"], 
+            token_data["user_email"], 
+            expiration_time # 計算した有効期限を使用
+        )
+        
+        # DB書き込み実行
+        db_result = execute_sql(insert_query, db_params)
+        
+        if "error" in db_result:
+            return db_result
+        
+        return {"success": True}
+        
+    except Exception as e:
+        import traceback
+        return {
+            "error": "INSERT_PROC_FAIL",
+            "message": str(e),
+        }
+
+# =========================================================
+#★ 新規ユーザー登録のためのデータ検証関数
+# =========================================================
+
+def parse_and_validate_registration_data(user_text):
+    """
+    ユーザー入力をパースし、指定された厳格なルールで検証する
+    """
+    
+    # 1. 前処理: 全角スペースを半角に変換し、連続するスペースを1つにまとめる
+    normalized_text = user_text.replace("　", " ").strip()
+    
+    # 【検証 1: 分割と要素数のチェック】
+    # 複数のスペースを1つのスペースに置き換え、分割する
+    parts = re.split(r'\s+', normalized_text)
+    
+    if len(parts) != 4:
+        return {"error": "入力された情報が不足しています。**学年・クラス・姓・名**をすべてスペース区切りで入力してください。"}
+    
+    grade, user_class, last_name, first_name = parts
+    
+    # 【検証 2: 学年とクラスの厳格なチェック（「年」や「組」の混入防止）】
+    
+    # 学年 (1〜3の数字)
+    grade_num_str = unicodedata.normalize('NFKC', grade) # 全角数字を半角に
+    if not grade_num_str.isdigit() or not (1 <= int(grade_num_str) <= 3):
+        return {"error": "学年は1から3の数字のみを入力してください。（例: '2'）"}
+    
+    # クラス (数字のみ)
+    user_class_num_str = unicodedata.normalize('NFKC', user_class) # 全角数字を半角に
+    if not user_class_num_str.isdigit():
+        return {"error": "クラスは数字のみを入力してください。（例: 'A'ではなく'1'）"}
+    
+    # 【検証 3: 姓・名"のチェック（数字、記号の禁止）】
+    # 漢字、ひらがな、カタカナ、英字以外を禁止する正規表現
+    # ただし、姓や名が空の場合は弾く
+    name_pattern = re.compile(r'^[ぁ-んァ-ヶ一-龠a-zA-Z]+$')
+    
+    if not name_pattern.match(last_name):
+        return {"error": f"姓（{last_name}）に数字や記号を含めることはできません。文字のみで入力してください。"}
+
+    if not name_pattern.match(first_name):
+        return {"error": f"名（{first_name}）に数字や記号を含めることはできません。文字のみで入力してください。"}
+    
+    # 検証にすべて成功した場合
+    return {
+        "success": True,
+        "data": {
+            "grade": int(grade_num_str),
+            "class": int(user_class_num_str),
+            "last_name": last_name,
+            "first_name": first_name
+        }
+    }        
+# =========================================================
+# 5A. 応答処理ヘルパー関数群 (最新の責務分離版)
+# =========================================================
+
+def handle_admin_holiday(line_user_id):
+    """管理者休日登録キーワードに対する処理。認証キーを生成し、DBに記録後、リンクを返却する。"""
+    
+    # 1. 管理者IDの取得（DB SELECT）
+    ADMIN_ID_SQL = "SELECT admin_id FROM admins WHERE admin_line_id = %s;"
+    admin_data = execute_sql(ADMIN_ID_SQL, params=(line_user_id,), fetch=True)
+    
+    # 2. データベースエラーチェック (簡略化)
+    if "error" in admin_data:
+        error_msg = f"🚨 データベース検索エラーが発生しました。"
+        # クラッシュ回避のため、シンプルなテキストメッセージを送信
+        line_bot_api.reply_message(
+            event.reply_token,
+            TextMessage(text=error_msg)
+        )
+        return
+
+    # 3. 管理者認証チェック
+    if not admin_data:
+        error_msg = "⚠️ あなたは管理者として登録されていません。"
+        line_bot_api.reply_message(
+            event.reply_token,
+            TextMessage(text=error_msg)
+        )
+        return
+
+    try:
+        # 取得した admin_id (INTEGER型)
+        admin_id_int = admin_data[0]['admin_id'] 
+    except (IndexError, KeyError):
+        error_msg = "🚨 内部エラー: 管理者IDを抽出できませんでした。"
+        line_bot_api.reply_message(
+            event.reply_token,
+            TextMessage(text=error_msg)
+        )
+        return
+
+    # 4. ボタン付きメッセージを作成し、LINE API経由で直接送信
+    # Postbackデータに admin_id を埋め込む（次の処理に渡す情報）
+    postback_data = f"action=register_holiday&admin_id={admin_id_int}"
+    
+    message = TemplateSendMessage(
+        alt_text="休日登録フォームを開くか確認中です。",
+        template=ConfirmTemplate(
+            text="休日登録用フォームを開きますか？",
+            actions=[
+                PostbackAction(
+                    label="はい",
+                    data=postback_data,
+                    display_text="はい、フォームを開きます"
+                ),
+                MessageAction(
+                    label="いいえ",
+                    text="いいえ"
+                )
+            ]
+        )
+    )
+    
+    # 🚨 最終ステップ: LINE APIを通じてメッセージを直接送信 🚨
+    # この処理は成功すれば None を返し、WebHookメイン関数をクラッシュさせない
+    line_bot_api.reply_message(
+        event.reply_token,
+        message
+    )
+    
+    return # None を返すことで、WebHookのメイン処理が二重に応答するのを防ぐ
+
+# ★★★ 削除されていた関数の復元 ★★★
+def handle_admin_user_order(line_user_id):
+    #return "ユーザー別注文状況機能"
+    # 🚨 修正: テンプレートメッセージのロジックをすべて削除 🚨
+    # 応答メッセージの内容
+    confirmation_text = "テクマクマヤコンしますか？\n\n（現在、システム応答確認のため、シンプルなメッセージで応答しています）"
+    
+    # シンプルなテキスト応答を返却
+    response_message = confirmation_text
+    
+    # 応答形式は、LINE Bot SDKの仕様に依存
+    return response_message
+
+def handle_admin_daily_order(line_user_id):
+    return "日別注文状況機能"
+
+# 一般ユーザーキーワードに対するダミー関数
+def handle_user_order(line_user_id):
+    return "一般ユーザー向け注文機能"
+
+# ---------------------------------------------
+# 🌟 ディスパッチテーブル（キーワードと処理の対応付け）
+# ---------------------------------------------
+
+ADMIN_ACTIONS = {
+    "休み": handle_admin_holiday,
+    "テクマクマヤコン": handle_admin_user_order,
+    "ゆりぴょんチェック": handle_admin_daily_order,
+}
+
+# =========================================================
+# 5. 🚨 メッセージイベント発生時の処理（ディスパッチテーブル適用）
 # =========================================================
 @handler.add(MessageEvent, message=TextMessage)
 def handle_message(event):
     line_user_id = event.source.user_id
     user_text = event.message.text
-    response_text = "コマンドが認識できませんでした。" 
+    response_text = None 
+    
+    DELETE_SQL = "DELETE FROM registration_states WHERE user_line_id = %s;"
     
     # ----------------------------------------------------
-    # 1. ユーザー認証ロジック：ユーザー検索
+    # 1. ID 検索とステータス取得 (元のコードと同じ)
     # ----------------------------------------------------
-    USER_CHECK_SQL = "SELECT user_id FROM users WHERE user_line_id = %s;"
+    USER_CHECK_SQL = "SELECT user_id FROM users WHERE user_line_id = %s;" 
     user_result = execute_sql(USER_CHECK_SQL, params=(line_user_id,), fetch=True)
+    is_user = bool(user_result)
     
-    # ユーザー検索でエラーが発生した場合
-    if "error" in user_result:
+    ADMIN_CHECK_SQL = "SELECT admin_id FROM admins WHERE admin_line_id = %s;"
+    admin_result = execute_sql(ADMIN_CHECK_SQL, params=(line_user_id,), fetch=True)
+    is_admin = bool(admin_result)
+    
+    # DBエラーチェック (ifは残る)
+    if "error" in user_result or "error" in admin_result:
         response_text = f"🚨 データベースエラーが発生しました。時間を置いてお試しください。"
-        print(f"!!! ユーザー検索失敗: {user_result['error']} !!!")
-    
-    # ユーザーがDBに見つからなかった場合 (新規ユーザー)
-    elif not user_result: 
         
-        if user_text == constants.USER_KEYWORD_REGISTER:
-            if not HOST_URL:
-                response_text = "🚨 設定エラー: フォームURLが設定されていません。"
-            else:
-                # ★★★ 修正箇所: トークンを生成し、URLに埋め込む ★★★
-                generated_token = create_registration_token(line_user_id)
-                if generated_token:
-                    # トークンをURLのパラメータとして使用
-                    registration_url = f"{HOST_URL}/register_form?token={generated_token}"
+    # ----------------------------------------------------
+    # 2. 応答決定ロジック（ディスパッチテーブルを使用）
+    # ----------------------------------------------------
+    
+    # response_textが既に設定されている（DBエラーなど）場合はスキップ
+    if response_text is None:
+        
+        # 🚨 判定値の確認 🚨
+        print(f"DEBUG: is_user={is_user}, is_admin={is_admin}, Text='{user_text}'")
+        # 2.1. ⭐ 管理者機能の最優先処理
+        if is_user and is_admin:
+            # 辞書から対応する関数を取得
+            # 🚨 管理者ブロック到達確認 🚨
+            print(f"DEBUG: ★★★ 管理者ブロックに到達 ★★★")
+            handler = ADMIN_ACTIONS.get(user_text)
+            # 🚨 辞書検索結果の確認 🚨
+            print(f"DEBUG: 辞書検索結果 (handler): {handler}")
+            if handler:
+                response_text = handler(line_user_id) # 関数を実行し結果を取得
+        
+        # 2.2. 一般ユーザー機能の処理
+        if response_text is None and is_user and user_text == "注文":
+            response_text = handle_user_order(line_user_id)
 
-                    response_text = "ユーザー登録ありがとうございます。\n以下のURLから必要事項を入力してください。\n\n"
-                    response_text += registration_url
-                    response_text += "\n\n⚠️ このURLは5分で無効になります。"
+        # 2.3. デフォルト応答（未登録ユーザーの処理と登録済みユーザーの誘導）
+        if response_text is None:
+            
+            # 2.3A. 登録済みユーザーのデフォルト応答
+            if is_user:
+                response_text = "別のメッセージを送ってください"
+            
+            # 2.3B. 未登録ユーザーの処理 (元のelseブロックを関数化するのが望ましいが、ここではインデントリスク回避のため可能な限り元の構造を残す)
+            else: 
+                # ユーザー名取得 (try/exceptは残る)
+                try:
+                    profile = line_bot_api.get_profile(line_user_id)
+                    user_line_name = profile.display_name
+                except Exception:
+                    user_line_name = "お客様"
+                
+                # 状態の取得 (DBアクセスは残る)
+                STATE_SELECT_SQL = "SELECT * FROM registration_states WHERE user_line_id = %s;"
+                state_result = execute_sql(STATE_SELECT_SQL, params=(line_user_id,), fetch=True)
+                state_data = state_result[0] if state_result and "error" not in state_result else None
+                
+                # 登録継続フロー (if/elseが多層に残る部分)
+                if state_data:
+                    # ... 登録継続ロジック (元のコードのA-i, A-iiの部分) ...
+                    # 💡 注意: この部分は手続き的なフロー制御のため、if/elseを完全に排除することは困難です。
+                    # ここでは、元のコードの複雑な if/else 構造を維持します。
+                    
+                    temp_data = {
+                        'grade': state_data.get('temp_user_grade'), 'class': state_data.get('temp_user_class'),
+                        'last_name': state_data.get('temp_user_last_name'), 'first_name': state_data.get('temp_user_first_name'),
+                    }
+                    is_data_filled = temp_data['grade'] is not None 
+                    
+                    # データの最終確認待ち (A-i)
+                    if is_data_filled: 
+                        if user_text.lower() in ["はい", "yes"]:
+                            # 最終登録処理の if/else
+                            INSERT_USERS_SQL = "INSERT INTO users (user_line_id, user_grade, user_class, user_last_name, user_first_name, user_line_name) VALUES (%s, %s, %s, %s, %s, %s);"
+                            final_reg_result = execute_sql(INSERT_USERS_SQL, (line_user_id, temp_data['grade'], temp_data['class'], temp_data['last_name'], temp_data['first_name'], user_line_name))
+                            
+                            if "success" in final_reg_result:
+                                execute_sql(DELETE_SQL, (line_user_id,))
+                                response_text = f"{user_line_name} さん、ユーザー登録が完了しました！🎉"
+                            else:
+                                execute_sql(DELETE_SQL, (line_user_id,))
+                                response_text = f"🚨 最終登録処理中にデータベースエラーが発生しました。登録を中断しました。再度**「登録」**と送ってください。"
+                        else: 
+                            execute_sql(DELETE_SQL, (line_user_id,))
+                            response_text = "登録を中断しました。再度**「登録」**と送ってください。"
+
+                    # データ入力待ち (A-ii)
+                    else: 
+                        validation_result = parse_and_validate_registration_data(user_text)
+                        if validation_result.get("success"):
+                            # UPDATE SQLの実行
+                            new_temp_data = validation_result.get("data")
+                            UPDATE_SQL = "UPDATE registration_states SET temp_user_grade = %s, temp_user_class = %s, temp_user_last_name = %s, temp_user_first_name = %s, temp_user_line_name = %s WHERE user_line_id = %s;"
+                            execute_sql(UPDATE_SQL, (new_temp_data['grade'], new_temp_data['class'], new_temp_data['last_name'], new_temp_data['first_name'], user_line_name, line_user_id))
+
+                            d = new_temp_data
+                            response_text = f"以下の内容で登録しますか？\n学年：**{d['grade']}**、クラス：**{d['class']}**\n氏名：**{d['last_name']} {d['first_name']}**\n\nよろしければ**「はい」**、やめる場合は「いいえ」と送ってください。"
+                        else:
+                            execute_sql(DELETE_SQL, (line_user_id,))
+                            error_message = validation_result.get('error', '入力が不正です。')
+                            response_text = f"⚠️ 入力エラー：{error_message}\n\n登録を中断しました。再度**「登録」**と送ってください。"
+
+                # 登録開始 (B)
                 else:
-                    response_text = "🚨 トークン生成中にエラーが発生しました。時間を置いてお試しください。"
-        else:
-            # 登録誘導メッセージを構築 (変更なし)
-            try:
-                profile = line_bot_api.get_profile(line_user_id)
-                user_line_name = profile.display_name
-            except Exception:
-                user_line_name = "お客様" 
-            
-            print(f"新規ユーザーを検出: {user_line_name} ({line_user_id})")
-            response_text = "{} さん、こんにちは！\n当サービスのご利用にはユーザー登録が必要です。\n\n『登録』と送っていただくと、登録フォームのURLをお送りします。".format(user_line_name)
-    
+                    if user_text == "登録": 
+                        INSERT_SQL = "INSERT INTO registration_states (user_line_id) VALUES (%s);"
+                        start_result = execute_sql(INSERT_SQL, (line_user_id,))
+                        
+                        if "success" in start_result:
+                            response_text = "登録を開始します。\n\n**学年（1〜3）・クラス・姓・名**をスペース区切りで一度に返信してください。\n例: 2 1 山田 太郎"
+                        else:
+                            response_text = "🚨 登録開始中にデータベースエラーが発生しました。再度「登録」と送ってください。"
+                    else:
+                        response_text = f"{user_line_name} さん、ユーザー情報が未登録です。\n登録をご希望の場合は、**「登録」**と送ってください。"
+
     # ----------------------------------------------------
-    # 2. 既存ユーザーの場合の処理（省略）
+    # 3. LINEに応答を返す (元のコードと同じ)
     # ----------------------------------------------------
-    else:
-        # ... 既存ユーザーのロジック ...
-        user_id = user_result[0]['user_id']
-        response_text = f"ユーザーID: {user_id} の既存ユーザーです。\nメッセージ: '{user_text}' を受け付けました。"
-            
-    # LINEに応答を返す（省略）
-    try:
-        line_bot_api.reply_message(
-            event.reply_token,
-            TextSendMessage(text=response_text)
-        )
-        print(f"Reply sent successfully. Text: {response_text}")
-    except Exception as e:
-        print(f"REPLY API ERROR: {e}")
-
-
-# =========================================================
-# 6. 新しい Flask ルートの追加 (登録フォーム表示用)
-# =========================================================
-@app.route("/register_form", methods=['GET'])
-def display_registration_form():
-    """LINEから送られたURLクリック時にフォームを表示する"""
-    access_token = request.args.get('token')
-    
-    if not access_token:
-        return "エラー: アクセストークンが不足しています。", 400
-
-    # 1. データベースでトークンを検索し、有効期限をチェックする
-    CHECK_TOKEN_SQL = "SELECT user_line_id FROM auth_tokens WHERE token = %s AND expires_at > NOW();"
-    token_result = execute_sql(CHECK_TOKEN_SQL, params=(access_token,), fetch=True)
-    
-    if not token_result:
-        return "エラー: トークンが無効であるか、有効期限が切れています。再度LINEで「登録」と送ってください。", 403
-
-    # 2. トークンから LINE ID を取得
-    line_user_id = token_result[0]['user_line_id']
-    
-    # templates/register_form.html をレンダリングし、LINE IDを渡す
-    return render_template('register_form.html', line_user_id=line_user_id)
+    if response_text:
+        try:
+            line_bot_api.reply_message(
+                event.reply_token,
+                TextSendMessage(text=response_text)
+            )
+            return 'OK'
+        except Exception as e:
+            print(f"REPLY API ERROR: {e}")
+            return 'Error'
+    return 'OK'

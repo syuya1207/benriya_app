@@ -82,14 +82,15 @@ CREATE TABLE products (
 -- パスワードリセット等の汎用認証トークン
 CREATE TABLE auth_tokens (
     token VARCHAR(64) PRIMARY KEY, 
-    user_id INTEGER REFERENCES users(user_id) NULL, 
-    admin_id INTEGER REFERENCES admins(admin_id) NULL, 
-    user_line_id VARCHAR(100),
-    user_email VARCHAR(255), 
-    admin_email VARCHAR(255),
+    user_id INTEGER NULL, 
+    admin_id INTEGER NULL, 
+    user_line_id VARCHAR(100) NULL,
+    user_email VARCHAR(255) NULL, 
+    admin_email VARCHAR(255) NULL,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-    expires_at TIMESTAMP WITH TIME ZONE NOT NULL
-    
+    expires_at TIMESTAMP WITH TIME ZONE NOT NULL,
+    FOREIGN KEY (user_id) REFERENCES users(user_id),
+    FOREIGN KEY (admin_id) REFERENCES admins(admin_id)
 );
 
 
