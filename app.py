@@ -183,9 +183,16 @@ def parse_and_validate_registration_data(user_text):
 
 # ---------------------- 管理者機能 --------------------------
 def admin_holiday(event, user_id):
-    # 後でここに休日登録処理を書く
-    return "（管理者）休日登録機能：あとで実装"
-
+    return TemplateSendMessage(
+        alt_text="休日登録フォームを開きますか？",
+        template=ConfirmTemplate(
+            text="休日登録フォームを開きますか？",
+            actions=[
+                MessageAction(label="はい", text="休日登録 はい"),
+                MessageAction(label="いいえ", text="休日登録 いいえ")
+            ]
+        )
+    )
 def admin_order_by_user(event, user_id):
     # 後でここにユーザー別注文状況処理を書く
     return "（管理者）テクマクマヤコン：あとで実装"
@@ -389,13 +396,14 @@ def handle_message(event):
     # 3. LINEに応答を返す (最終処理)
     # ----------------------------------------------------
     if response_text:
+        print("DEBUG:", type(response_text))
         try:
-            line_bot_api.reply_message(
-                event.reply_token,
-                TextSendMessage(text=response_text)
-            )
-            return 'OK'
+            if isinstance(response_text, TemplateSendMessage):
+                line_bot_api.reply_message(event.reply_token, response_text)
+            else:
+                line_bot_api.reply_message(event.reply_token, TextSendMessage(text=str(response_text)))
         except Exception as e:
-            print(f"REPLY API ERROR: {e}")
-            return 'Error'
+            print("REPLY ERROR:", e)
+            raise e
+
     return 'OK'
