@@ -1,6 +1,7 @@
 from flask import Flask, request, abort, render_template  # ★ render_template を追加
 
 import json
+import os
 
 from linebot import LineBotApi, WebhookHandler
 from linebot.exceptions import InvalidSignatureError
@@ -20,10 +21,12 @@ import secrets  # ★ 追加: 安全なトークン生成用
 from datetime import datetime, timedelta  # ★ 修正: timedelta を追加
 
 import constants
-
+from routes.admin_holiday import admin_holiday_yes
 
 from utils.db_utils import execute_sql
 from utils.validation import parse_and_validate_registration_data
+from routes.admin_holiday import register_store_holiday_form, admin_holiday_yes, admin_holiday_no
+DATABASE_URL = os.environ.get("DATABASE_URL")
 
 # import tasks
 
@@ -84,30 +87,10 @@ def webhook_handler():
     return "OK", 200
 
 
-
-
-
-
-
-
-
 # ============================================================
 # プレ5 まずここを追加（ファイル先頭〜handle_message より上）
 # ============================================================
 
-
-# ---------------------- 管理者機能 --------------------------
-def admin_holiday(event, user_id):
-    return TemplateSendMessage(
-        alt_text="休日登録フォームを開きますか？",
-        template=ConfirmTemplate(
-            text="休日登録フォームを開きますか？",
-            actions=[
-                MessageAction(label="はい", text="休日登録 はい"),
-                MessageAction(label="いいえ", text="休日登録 いいえ"),
-            ],
-        ),
-    )
 
 
 def admin_order_by_user(event, user_id):
@@ -133,7 +116,9 @@ def user_default(event, user_id):
 
 # ---------------------- ディスパッチ辞書 ----------------------
 ADMIN_DISPATCH = {
-    "休み": admin_holiday,
+    "休み": register_store_holiday_form,
+    "__ADMIN_CMD__ holiday_yes": admin_holiday_yes,
+    "__ADMIN_CMD__ holiday_no": admin_holiday_no,
     "テクマクマヤコン": admin_order_by_user,
     "ゆりぴょんチェック": admin_daily_status,
 }
