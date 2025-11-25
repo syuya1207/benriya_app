@@ -21,11 +21,11 @@ import secrets  # ★ 追加: 安全なトークン生成用
 from datetime import datetime, timedelta  # ★ 修正: timedelta を追加
 
 import constants
-from routes.admin_holiday import admin_holiday_yes
+
 
 from utils.db_utils import execute_sql
 from utils.validation import parse_and_validate_registration_data
-from routes.admin_holiday import register_store_holiday_form, admin_holiday_yes, admin_holiday_no
+from routes.admin_holiday import register_store_holiday_form
 DATABASE_URL = os.environ.get("DATABASE_URL")
 
 # import tasks
@@ -117,8 +117,6 @@ def user_default(event, user_id):
 # ---------------------- ディスパッチ辞書 ----------------------
 ADMIN_DISPATCH = {
     "休み": register_store_holiday_form,
-    "__ADMIN_CMD__ holiday_yes": admin_holiday_yes,
-    "__ADMIN_CMD__ holiday_no": admin_holiday_no,
     "テクマクマヤコン": admin_order_by_user,
     "ゆりぴょんチェック": admin_daily_status,
 }
