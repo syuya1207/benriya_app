@@ -2,7 +2,7 @@
 *
 # Pythonのキャッシュファイル
 __pycache__/
-#*.pyc
+*.pyc
 
 # 仮想環境全体
 venv/
