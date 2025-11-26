@@ -26,6 +26,8 @@ import constants
 from utils.db_utils import execute_sql
 from utils.validation import parse_and_validate_registration_data
 from routes.admin_holiday import register_store_holiday_form
+from routes.admin_holiday import admin_holiday_bp
+
 DATABASE_URL = os.environ.get("DATABASE_URL")
 
 # import tasks
@@ -59,6 +61,7 @@ print(f"DEBUG: HOST_URL is set to: {HOST_URL}")
 # 2. Flask/SDKの初期化
 # =========================================================
 app = Flask(__name__)
+app.register_blueprint(admin_holiday_bp)
 if SECRET_KEY:
     app.secret_key = SECRET_KEY
 else:
