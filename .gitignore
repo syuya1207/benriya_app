@@ -2,10 +2,12 @@
 *
 # Pythonのキャッシュファイル
 __pycache__/
-*.pyc
+#*.pyc
 
 # 仮想環境全体
 venv/
 
 # 環境変数（機密情報）
 .env
+
+!admin_holiday.py
