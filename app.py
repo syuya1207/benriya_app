@@ -18,8 +18,7 @@ from dotenv import load_dotenv
 import datetime
 
 import secrets  # ★ 追加: 安全なトークン生成用
-from datetime import datetime, timedelta  # ★ 修正: timedelta を追加
-
+from datetime import datetime, timedelta, timezone
 import constants
 
 

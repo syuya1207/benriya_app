@@ -1,3 +1,4 @@
+from datetime import datetime, timedelta, timezone
 import secrets
 from datetime import datetime, timedelta
 from utils.db_utils import execute_sql
@@ -8,12 +9,16 @@ from utils.db_utils import execute_sql
 def create_token(admin_id=None, user_id=None, ttl_minutes=10):
     
     token = secrets.token_hex(32)
-    expires_at = datetime.utcnow() + timedelta(minutes=ttl_minutes)
+    now_utc = datetime.now(timezone.utc)
+    expires_at = now_utc + timedelta(minutes=ttl_minutes)
 
     sql = """
         INSERT INTO auth_tokens (token, admin_id, user_id, created_at, expires_at)
-        VALUES (%s, %s, %s, NOW(), %s)
+        -- created_at も同様に Aware UTC にすべきですが、今回はPython側で処理します
+        VALUES (%s, %s, %s, NOW(), %s) 
     """
+    # NOW() は DB サーバーの時刻設定（通常 UTC）に依存しますが、
+    # expires_at は Python が生成した Aware な時刻が渡されます。
     params = (token, admin_id, user_id, expires_at)
 
     res = execute_sql(sql, params)
