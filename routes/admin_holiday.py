@@ -1,4 +1,4 @@
-from flask import Blueprint, request, render_template, redirect, url_for, current_app
+from flask import Blueprint, request, render_template, redirect, url_for, current_app, jsonify
 from linebot.models import TemplateSendMessage, ConfirmTemplate, MessageAction, TextSendMessage
 from utils.db_utils import execute_sql
 from utils.token_utils import create_token
@@ -98,45 +98,66 @@ def admin_holiday_form():
 
 
 # フォーム送信処理
-@admin_holiday_bp.route("/admin/holiday", methods=["POST"])
+@admin_holiday_bp.route("/admin/holiday/submit", methods=["POST"])
 def admin_holiday_submit():
-    token = request.form.get("token")
-    holiday_date = request.form.get("holiday_date")
-    note = request.form.get("note", "")
+    # HTMLのJavaScriptはJSON形式でデータを送信しています
+    data = request.get_json() 
+    
+    token = data.get("token")
+    dates_array = data.get("dates", []) # 🚨 3. 'dates'キーから日付リストを取得
+    
+    current_app.logger.info(f"INFO: 休日登録リクエスト受信。選択日: {dates_array}")
 
     if not token:
-        return "トークンがありません。", 400
+        # 成功/失敗にかかわらず、JavaScriptがJSON応答を期待しているためjsonifyで返す
+        return jsonify({"success": False, "message": "トークンがありません。"}), 400
 
-    # トークン再チェック
-    sql = """
-        SELECT expires_at 
-        FROM auth_tokens 
-        WHERE token = %s
-    """
+    # --- トークン再チェック ---
+    sql = "SELECT expires_at FROM auth_tokens WHERE token = %s"
+    # execute_sql の呼び出しは元のコードの通り
     result = execute_sql(sql, (token,), fetch=True)
 
     if not result:
-        return "無効なトークンです。", 400
+        return jsonify({"success": False, "message": "無効なトークンです。"}), 400
 
     expires_at = result[0]["expires_at"]
+    
+    # タイムゾーン処理は元のコードの通り
     if expires_at.tzinfo is None:
         expires_at = expires_at.replace(tzinfo=timezone.utc)
     
     # 有効期限チェック（UTC-awareで比較）
     now_utc = datetime.now(timezone.utc)
     if now_utc > expires_at:
-       execute_sql("DELETE FROM auth_tokens WHERE token = %s", (token,))
-       return "トークンの有効期限が切れています。", 400
+        execute_sql("DELETE FROM auth_tokens WHERE token = %s", (token,))
+        return jsonify({"success": False, "message": "トークンの有効期限が切れています。"}), 400
+    # --- トークン検証 終了 ---
+    
+    try:
+        # 🚨 4. DB操作ロジックの変更（複数日対応）
+        
+        # 4-1. 今日の日付より未来の休日を一旦全て削除（上書き登録の準備）
+        # HTML側で過去日は選択不可になっているため、今日以降のデータを全てクリアします。
+        today_date_str = datetime.now().strftime("%Y-%m-%d")
+        execute_sql("DELETE FROM holidays WHERE holiday_date >= %s", (today_date_str,))
 
-    # holidays に登録
-    sql = """
-        INSERT INTO holidays (holiday_date, note)
-        VALUES (%s, %s)
-        ON CONFLICT (holiday_date) DO UPDATE SET note = EXCLUDED.note
-    """
-    execute_sql(sql, (holiday_date, note))
+        # 4-2. 選択された日付を全て INSERT
+        # note はこのフォームでは入力されていないため、空欄で登録します
+        insert_sql = "INSERT INTO holidays (holiday_date, note) VALUES (%s, %s)"
+        
+        # 日付文字列をdatetimeオブジェクトに変換し、note(空)とペアにする
+        for date_str in dates_array:
+             date_value = datetime.strptime(date_str, "%Y-%m-%d")
+             execute_sql(insert_sql, (date_value, "")) 
+             
+        # 4-3. トークン削除（1回だけ有効）
+        execute_sql("DELETE FROM auth_tokens WHERE token = %s", (token,))
 
-    # トークン削除（1回だけ有効）
-    execute_sql("DELETE FROM auth_tokens WHERE token = %s", (token,))
-
-    return "登録が完了しました！"    
+        return jsonify({
+            "success": True, 
+            "message": f"{len(dates_array)}件の休業日リストの登録と更新が完了しました。"
+        }), 200 
+        
+    except Exception as e:
+        current_app.logger.error(f"FATAL ERROR: 休日登録処理中にデータベースエラーが発生しました: {e}", exc_info=True)
+        return jsonify({"success": False, "message": f"登録中にサーバーエラーが発生しました: {e}"}), 500

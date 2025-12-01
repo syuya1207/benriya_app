@@ -11,3 +11,5 @@ venv/
 .env
 
 !admin_holiday.py
+!replicate_user.py
+!replicate.py
